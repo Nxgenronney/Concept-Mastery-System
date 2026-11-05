@@ -923,6 +923,17 @@ def extract_raw_content_node(state: IngestionState) -> Dict[str, Any]:
     stype = state["source_type"]
     custom_title = state.get("custom_title")
 
+    # URL moderation can pass the exact fetched payload into ingestion. This
+    # prevents a second fetch from changing after screening and being persisted.
+    preloaded = state.get("preloaded_content")
+    if preloaded is not None:
+        return {
+            "title": preloaded["title"],
+            "raw_items": preloaded["raw_items"],
+            "structured_preview": preloaded["structured_preview"],
+            "raw_text": preloaded["raw_text"],
+        }
+
     if stype == "youtube":
         title, raw_items, preview, raw_text = load_youtube_material(target, custom_title=custom_title)
     elif stype == "web":
@@ -1039,6 +1050,30 @@ class UniversalMaterialIngestor:
     """Unified Orchestrator for Multi-Format Study Material Ingestion & Knowledge Base Management."""
 
     @classmethod
+    def preview_url(cls, url: str, source_type: str = "auto", title: Optional[str] = None) -> Dict[str, Any]:
+        """Fetch and extract URL content without persisting or indexing it."""
+        initial_state: IngestionState = {
+            "input_target": url.strip(),
+            "source_type": source_type,
+            "user_id": "moderation-preview",
+            "custom_title": title,
+            "material_id": "moderation-preview",
+            "title": "",
+            "origin_name": url.strip(),
+            "raw_text": "",
+            "structured_preview": [],
+            "raw_items": [],
+            "chunks": [],
+            "concepts": [],
+            "edges": [],
+            "error": None,
+        }
+        detected = detect_source_type_node(initial_state)
+        initial_state.update(detected)
+        extracted = extract_raw_content_node(initial_state)
+        return extracted
+
+    @classmethod
     def ingest_file(cls, path: Path, user_id: str = "default", title: Optional[str] = None) -> Dict[str, Any]:
         """Ingest any supported file format (.pdf, .pptx, .md, .txt, .docx, .mp3, .wav, .m4a)."""
         material_id = f"mat_{uuid.uuid4().hex[:10]}"
@@ -1072,7 +1107,7 @@ class UniversalMaterialIngestor:
         }
 
     @classmethod
-    def ingest_url(cls, url: str, source_type: str = "auto", user_id: str = "default", title: Optional[str] = None) -> Dict[str, Any]:
+    def ingest_url(cls, url: str, source_type: str = "auto", user_id: str = "default", title: Optional[str] = None, preloaded_content: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Ingest YouTube video or educational website."""
         material_id = f"mat_{uuid.uuid4().hex[:10]}"
         initial_state: IngestionState = {
@@ -1091,6 +1126,8 @@ class UniversalMaterialIngestor:
             "edges": [],
             "error": None,
         }
+        if preloaded_content is not None:
+            initial_state["preloaded_content"] = preloaded_content
         final_state = INGESTION_GRAPH.invoke(initial_state)
         return {
             "material_id": material_id,

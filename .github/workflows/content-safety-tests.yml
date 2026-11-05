@@ -1,0 +1,32 @@
+name: Content Safety Tests
+
+on:
+  push:
+    branches:
+      - feat/explicit-content-safeguard
+  pull_request:
+
+jobs:
+  content-safety:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: concept-mastery/backend
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: concept-mastery/backend/requirements.txt
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+      - name: Run content-safety regression tests
+        env:
+          PYTHONPATH: .
+        run: |
+          python -m pytest tests/test_content_safety.py tests/test_content_safety_adversarial.py tests/test_url_moderation_flow.py -q

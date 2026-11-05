@@ -148,6 +148,20 @@ CREATE TABLE IF NOT EXISTS explainable_mastery_decisions (
     updated_at                      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_mastery_decisions_user_concept ON explainable_mastery_decisions(user_id, concept_id);
+
+-- Medical learner verification; uploaded ID evidence is stored outside public uploads.
+CREATE TABLE IF NOT EXISTS medical_verification_requests (
+    user_id TEXT PRIMARY KEY,
+    institution TEXT NOT NULL,
+    program TEXT NOT NULL,
+    educational_email TEXT NOT NULL,
+    id_card_filename TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'verified', 'rejected')),
+    submitted_at TEXT NOT NULL,
+    reviewed_at TEXT,
+    reviewed_by TEXT,
+    review_notes TEXT DEFAULT ''
+);
 """
 
 @contextmanager
@@ -1168,3 +1182,69 @@ def load_json(path, default):
 
 def save_json(path, data):
     path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def submit_medical_verification_request(user_id: str, institution: str, program: str, educational_email: str, id_card_filename: str) -> dict:
+    """Create or refresh a pending medical-student verification request."""
+    init_materials_db()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with get_materials_db() as conn:
+        conn.execute(
+            """INSERT INTO medical_verification_requests
+               (user_id, institution, program, educational_email, id_card_filename, status, submitted_at, reviewed_at, reviewed_by, review_notes)
+               VALUES (?, ?, ?, ?, ?, 'pending', ?, NULL, NULL, '')
+               ON CONFLICT(user_id) DO UPDATE SET
+                 institution=excluded.institution, program=excluded.program,
+                 educational_email=excluded.educational_email,
+                 id_card_filename=excluded.id_card_filename, status='pending',
+                 submitted_at=excluded.submitted_at, reviewed_at=NULL,
+                 reviewed_by=NULL, review_notes=''""",
+            (user_id, institution, program, educational_email.lower().strip(), id_card_filename, now_iso),
+        )
+    return get_medical_verification_request(user_id) or {}
+
+
+def get_medical_verification_request(user_id: str) -> dict | None:
+    """Return a learner's medical-verification status (never the ID file bytes)."""
+    init_materials_db()
+    with get_materials_db() as conn:
+        row = conn.execute(
+            """SELECT user_id, institution, program, educational_email, status,
+                      submitted_at, reviewed_at, reviewed_by, review_notes
+               FROM medical_verification_requests WHERE user_id=?""",
+            (user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_medical_verification_requests() -> list[dict]:
+    """List verification requests for authorized manual reviewers."""
+    init_materials_db()
+    with get_materials_db() as conn:
+        rows = conn.execute(
+            """SELECT user_id, institution, program, educational_email, id_card_filename,
+                      status, submitted_at FROM medical_verification_requests
+               ORDER BY submitted_at ASC"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def review_medical_verification_request(user_id: str, status: str, reviewer: str, notes: str = "") -> dict | None:
+    """Approve/reject a request after independent ID-card and institution-email checks."""
+    if status not in {"verified", "rejected"}:
+        raise ValueError("status must be 'verified' or 'rejected'")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with get_materials_db() as conn:
+        conn.execute(
+            """UPDATE medical_verification_requests
+               SET status=?, reviewed_at=?, reviewed_by=?, review_notes=?
+               WHERE user_id=?""",
+            (status, now_iso, reviewer, notes[:1000], user_id),
+        )
+    return get_medical_verification_request(user_id)
+
+
+def is_medical_verified(user_id: str) -> bool:
+    """Return True only after an authorized reviewer has approved the learner."""
+    request = get_medical_verification_request(user_id)
+    return bool(request and request.get("status") == "verified")
