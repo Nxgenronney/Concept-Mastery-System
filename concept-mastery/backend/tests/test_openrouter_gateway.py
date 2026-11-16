@@ -111,8 +111,8 @@ def test_offline_deterministic_fallback_guardrail():
 
 def test_live_openrouter_execution(monkeypatch):
     """Verify live OpenRouter completion and fallback when key is active and live mode is enabled."""
-    if not config.OPENROUTER_API_KEY:
-        pytest.skip("OPENROUTER_API_KEY not configured.")
+    if not config.OPENROUTER_API_KEY or os.getenv("OFFLINE_TEST") == "1":
+        pytest.skip("OPENROUTER_API_KEY not configured or offline test mode enabled.")
 
     # Enable live execution for this test
     monkeypatch.setenv("OPENROUTER_LIVE", "1")

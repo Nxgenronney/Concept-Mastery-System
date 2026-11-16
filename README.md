@@ -203,6 +203,14 @@ Concept-Mastery-System/
 - **Stage 3 (Blind Retrieval)**: Notes completely unmounted from DOM; open-ended retrieval textarea with word counter + 1 verification check.
 - **Stage 4 (Gap Audit)**: Retrieval score donut (0–100%), green retained concept pills, red missed gap pills, memory audit against verified material, and epistemic mastery updates.
 
+### 7. Vision-Based Medical Student ID Verification
+- **AI-Powered ID Card Verification**: Students can upload a photo of their college/university ID card to verify medical/biological student status.
+- **Google Gemini Vision Integration**: Uses `gemini-3.5-flash-lite` model via Google Gemini API to extract and analyze ID card details.
+- **Structured JSON Extraction**: Returns `is_valid_id_card`, `student_name`, `institution`, `department_or_degree`, `is_medical_or_bio_student`, and `confidence_score`.
+- **Automatic Clinical Access**: Verified medical/biological students (confidence ≥ 0.7) gain automatic access to restricted clinical study materials.
+- **Privacy-First Design**: ID card images are processed in-memory via API and never stored on the server.
+- **Frontend Integration**: Seamless upload modal with file validation (JPEG/PNG/WebP/GIF, max 10MB) and real-time status updates.
+
 ---
 
 ## Quick Start
@@ -220,7 +228,7 @@ pip install -r requirements.txt
 
 # Configure environment keys
 cp .env.example .env
-# Edit .env with your OPENROUTER_API_KEY, GOOGLE_CLIENT_ID, etc.
+# Edit .env with your OPENROUTER_API_KEY, GOOGLE_CLIENT_ID, GEMINI_API_KEY (for ID verification), etc.
 
 # Start FastAPI server
 uvicorn app.main:app --port 8000 --reload

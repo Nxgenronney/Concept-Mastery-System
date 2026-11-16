@@ -1,6 +1,7 @@
 """Shared knowledge base (index + concepts), SQLite study materials, user auth, and audit log persistence."""
 from __future__ import annotations
 
+import hmac
 import json
 import sqlite3
 import uuid
@@ -148,6 +149,49 @@ CREATE TABLE IF NOT EXISTS explainable_mastery_decisions (
     updated_at                      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_mastery_decisions_user_concept ON explainable_mastery_decisions(user_id, concept_id);
+
+-- Medical learner verification records (Vision OCR provider-backed; no local ID card storage)
+CREATE TABLE IF NOT EXISTS medical_verification_requests (
+    user_id             TEXT PRIMARY KEY,
+    provider            TEXT NOT NULL DEFAULT 'vision_ocr',
+    verification_id     TEXT DEFAULT '',
+    program_id          TEXT DEFAULT '',
+    institution         TEXT NOT NULL DEFAULT '',
+    program             TEXT NOT NULL DEFAULT '',
+    educational_email   TEXT NOT NULL DEFAULT '',
+    id_card_filename    TEXT DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'pending',
+    metadata_json       TEXT NOT NULL DEFAULT '{}',
+    submitted_at        TEXT NOT NULL,
+    reviewed_at         TEXT,
+    reviewed_by         TEXT,
+    review_notes        TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_med_verif_id ON medical_verification_requests(verification_id);
+
+-- Vision OCR Webhook Audit & Idempotency / Anti-Replay Store
+CREATE TABLE IF NOT EXISTS sheerid_webhook_events (
+    event_id        TEXT PRIMARY KEY,
+    verification_id TEXT NOT NULL,
+    event_type      TEXT NOT NULL,
+    payload_json    TEXT NOT NULL,
+    received_at     TEXT NOT NULL,
+    processed_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sheerid_events_verif ON sheerid_webhook_events(verification_id);
+
+-- Institutional Email Ownership Verifications
+CREATE TABLE IF NOT EXISTS email_verifications (
+    token_id        TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL,
+    email           TEXT NOT NULL,
+    token_hash      TEXT NOT NULL,
+    expires_at      TEXT NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    verified_at     TEXT,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_email_verif_user ON email_verifications(user_id, email);
 """
 
 @contextmanager
@@ -166,6 +210,19 @@ def init_materials_db():
     config.VECTOR_STORE_PATH.mkdir(parents=True, exist_ok=True)
     with get_materials_db() as conn:
         conn.executescript(_MATERIALS_SCHEMA)
+        # Migrate medical_verification_requests columns if older table exists
+        try:
+            cols = [r["name"] for r in conn.execute("PRAGMA table_info(medical_verification_requests)").fetchall()]
+            if "provider" not in cols:
+                conn.execute("ALTER TABLE medical_verification_requests ADD COLUMN provider TEXT NOT NULL DEFAULT 'vision_ocr'")
+            if "verification_id" not in cols:
+                conn.execute("ALTER TABLE medical_verification_requests ADD COLUMN verification_id TEXT DEFAULT ''")
+            if "program_id" not in cols:
+                conn.execute("ALTER TABLE medical_verification_requests ADD COLUMN program_id TEXT DEFAULT ''")
+            if "metadata_json" not in cols:
+                conn.execute("ALTER TABLE medical_verification_requests ADD COLUMN metadata_json TEXT DEFAULT '{}'")
+        except Exception:
+            pass
 
 init_materials_db()
 
@@ -1168,3 +1225,244 @@ def load_json(path, default):
 
 def save_json(path, data):
     path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def record_sheerid_verification(
+    user_id: str,
+    verification_id: str,
+    program_id: str,
+    status: str = "pending",
+    institution: str = "",
+    program: str = "",
+    educational_email: str = "",
+    metadata: dict | None = None,
+) -> dict:
+    """Record or update a vision-OCR medical ID verification session."""
+    init_materials_db()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    meta_json = json.dumps(metadata or {})
+    with get_materials_db() as conn:
+        conn.execute(
+            """INSERT INTO medical_verification_requests
+               (user_id, provider, verification_id, program_id, institution, program, educational_email, id_card_filename, status, metadata_json, submitted_at, reviewed_at, reviewed_by, review_notes)
+               VALUES (?, 'vision_ocr', ?, ?, ?, ?, ?, '', ?, ?, ?, NULL, NULL, '')
+               ON CONFLICT(user_id) DO UPDATE SET
+                 provider='vision_ocr',
+                 verification_id=excluded.verification_id,
+                 program_id=excluded.program_id,
+                 institution=CASE WHEN excluded.institution != '' THEN excluded.institution ELSE medical_verification_requests.institution END,
+                 program=CASE WHEN excluded.program != '' THEN excluded.program ELSE medical_verification_requests.program END,
+                 educational_email=CASE WHEN excluded.educational_email != '' THEN excluded.educational_email ELSE medical_verification_requests.educational_email END,
+                 status=excluded.status,
+                 metadata_json=excluded.metadata_json,
+                 submitted_at=excluded.submitted_at""",
+            (user_id, verification_id, program_id, institution, program, educational_email.lower().strip(), status, meta_json, now_iso),
+        )
+    return get_medical_verification_request(user_id) or {}
+
+
+def update_sheerid_verification_status(
+    verification_id: str,
+    status: str,
+    metadata: dict | None = None,
+    review_notes: str = "",
+) -> dict | None:
+    """Update verification status based on vision-OCR extraction result."""
+    init_materials_db()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    meta_json = json.dumps(metadata or {})
+    with get_materials_db() as conn:
+        conn.execute(
+            """UPDATE medical_verification_requests
+               SET status=?, reviewed_at=?, reviewed_by='vision_ocr_provider', review_notes=?, metadata_json=?
+               WHERE verification_id=?""",
+            (status, now_iso, review_notes[:1000], meta_json, verification_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM medical_verification_requests WHERE verification_id=?", (verification_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_verification_by_sheerid_id(verification_id: str) -> dict | None:
+    """Lookup medical verification request by verification ID."""
+    init_materials_db()
+    with get_materials_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM medical_verification_requests WHERE verification_id=?", (verification_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def record_sheerid_webhook_event(
+    event_id: str,
+    verification_id: str,
+    event_type: str,
+    payload_json: str,
+) -> bool:
+    """Record an incoming vision-OCR verification event for replay protection.
+
+    Returns:
+        True if the event was newly recorded.
+        False if the event was already received (duplicate/replay).
+    """
+    init_materials_db()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with get_materials_db() as conn:
+        existing = conn.execute(
+            "SELECT event_id FROM sheerid_webhook_events WHERE event_id=?", (event_id,)
+        ).fetchone()
+        if existing:
+            return False
+        conn.execute(
+            """INSERT INTO sheerid_webhook_events
+               (event_id, verification_id, event_type, payload_json, received_at, processed_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (event_id, verification_id, event_type, payload_json, now_iso, now_iso),
+        )
+        return True
+
+
+def save_email_verification_challenge(
+    user_id: str,
+    email: str,
+    token_hash: str,
+    expires_at: str,
+) -> dict:
+    """Store an email verification challenge token hash."""
+    init_materials_db()
+    token_id = f"eml_{uuid.uuid4().hex[:12]}"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with get_materials_db() as conn:
+        conn.execute(
+            """INSERT INTO email_verifications
+               (token_id, user_id, email, token_hash, expires_at, attempts, verified_at, created_at)
+               VALUES (?, ?, ?, ?, ?, 0, NULL, ?)""",
+            (token_id, user_id, email.lower().strip(), token_hash, expires_at, now_iso),
+        )
+    return {"token_id": token_id, "user_id": user_id, "email": email}
+
+
+def verify_email_challenge(
+    user_id: str,
+    email: str,
+    candidate_hash: str,
+    now_iso: str,
+) -> tuple[bool, str]:
+    """Verify an email challenge code against stored hash."""
+    init_materials_db()
+    clean_email = email.lower().strip()
+    with get_materials_db() as conn:
+        row = conn.execute(
+            """SELECT * FROM email_verifications
+               WHERE user_id=? AND email=? AND verified_at IS NULL
+               ORDER BY created_at DESC LIMIT 1""",
+            (user_id, clean_email),
+        ).fetchone()
+
+        if not row:
+            return False, "No active verification challenge found for this email."
+
+        if row["attempts"] >= 5:
+            return False, "Too many failed verification attempts. Please request a new code."
+
+        if row["expires_at"] < now_iso:
+            return False, "Verification code has expired. Please request a new code."
+
+        if not hmac.compare_digest(row["token_hash"], candidate_hash):
+            conn.execute(
+                "UPDATE email_verifications SET attempts = attempts + 1 WHERE token_id=?",
+                (row["token_id"],),
+            )
+            return False, "Incorrect verification code."
+
+        # Success - mark verified
+        conn.execute(
+            "UPDATE email_verifications SET verified_at=? WHERE token_id=?",
+            (now_iso, row["token_id"]),
+        )
+        return True, ""
+
+
+def is_email_ownership_verified(user_id: str, email: str) -> bool:
+    """Return True if the user has proven mailbox control for this email."""
+    init_materials_db()
+    clean_email = email.lower().strip()
+    with get_materials_db() as conn:
+        row = conn.execute(
+            """SELECT token_id FROM email_verifications
+               WHERE user_id=? AND email=? AND verified_at IS NOT NULL
+               LIMIT 1""",
+            (user_id, clean_email),
+        ).fetchone()
+        return bool(row)
+
+
+def get_medical_verification_request(user_id: str) -> dict | None:
+    """Return a learner's medical-verification status."""
+    init_materials_db()
+    with get_materials_db() as conn:
+        row = conn.execute(
+            """SELECT user_id, provider, verification_id, program_id, institution, program, educational_email, status,
+                      submitted_at, reviewed_at, reviewed_by, review_notes
+               FROM medical_verification_requests WHERE user_id=?""",
+            (user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_medical_verification_requests() -> list[dict]:
+    """List verification requests."""
+    init_materials_db()
+    with get_materials_db() as conn:
+        rows = conn.execute(
+            """SELECT user_id, provider, verification_id, program_id, institution, program, educational_email,
+                      status, submitted_at, reviewed_at, review_notes FROM medical_verification_requests
+               ORDER BY submitted_at ASC"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def is_medical_verified(user_id: str) -> bool:
+    """Return True only after authoritative provider verification approves the learner."""
+    request = get_medical_verification_request(user_id)
+    return bool(request and request.get("status") in {"verified", "approved"})
+
+
+def purge_legacy_id_storage(base_dir: Path | None = None) -> dict[str, Any]:
+    """Securely dispose of any residual local identity-document files and references.
+
+    This is an operational safety utility. It does NOT delete study materials
+    (those live under UPLOAD_DIR). It only removes identity documents that may
+    have been written by a legacy manual-verification workflow, and blanks
+    legacy ``id_card_filename`` references in the database.
+    """
+    import shutil
+
+    target_dir = Path(base_dir) if base_dir else config.MEDICAL_VERIFICATION_DIR
+    deleted_files: list[str] = []
+    if target_dir.exists():
+        for entry in target_dir.glob("**/*"):
+            if entry.is_file():
+                try:
+                    entry.unlink()
+                    deleted_files.append(str(entry))
+                except OSError:
+                    pass
+        try:
+            shutil.rmtree(str(target_dir), ignore_errors=True)
+        except OSError:
+            pass
+
+    cleared_rows = 0
+    with get_materials_db() as conn:
+        cur = conn.execute(
+            "UPDATE medical_verification_requests SET id_card_filename='' WHERE id_card_filename != ''"
+        )
+        cleared_rows = cur.rowcount or 0
+
+    return {
+        "deleted_files": deleted_files,
+        "cleared_id_card_references": cleared_rows,
+        "target_dir": str(target_dir),
+    }

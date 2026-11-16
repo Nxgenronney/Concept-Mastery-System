@@ -360,10 +360,13 @@ Respond with valid JSON containing:
   "citations": ["{citations[0]}"]
 }}
 """
-        chunks_text = "\n\n".join([
-            f"--- Chunk ({getattr(c, 'locator_label', f'Page {getattr(c, 'page_number', 1)}')}) ---\n{getattr(c, 'text', '')}"
-            for c in chunks
-        ])
+        def _chunk_header(c):
+            loc = getattr(c, 'locator_label', None)
+            if not loc:
+                loc = f"Page {getattr(c, 'page_number', 1)}"
+            return f"--- Chunk ({loc}) ---\n{getattr(c, 'text', '')}"
+
+        chunks_text = "\n\n".join([_chunk_header(c) for c in chunks])
         user_prompt = f"""Task Type: {task_type}
 Concept: {concept_name} (ID: {concept_id})
 Custom Instructions: {custom_instructions or "None"}

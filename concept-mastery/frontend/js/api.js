@@ -84,7 +84,11 @@ const ENDPOINTS = {
   notesExport:         { method: "POST",   path: "/api/notes/{note_id}/export" },
   materialDeepAudio:   { method: "POST",   path: "/api/materials/{material_id}/deep-audio" },
   toolsGenerate:       { method: "POST",   path: "/api/tools/generate" },
-  artifactFile:        { method: "GET",    path: "/api/artifacts/{filename}" }
+  artifactFile:        { method: "GET",    path: "/api/artifacts/{filename}" },
+  medicalVerificationStatus: { method: "GET", path: "/api/auth/medical-verification" },
+  verifyMedicalId:     { method: "POST",   path: "/api/auth/verify-medical-id", isFormData: true },
+  emailChallengeReq:   { method: "POST",   path: "/api/auth/email-verification/request" },
+  emailChallengeVerify:{ method: "POST",   path: "/api/auth/email-verification/verify" }
 };
 
 /**
@@ -158,12 +162,18 @@ async function callApi(endpointKey, payload = null, options = {}) {
 
   if (!response.ok) {
     let message = "";
+    let detail = null;
     if (data && typeof data === "object") {
-      message = data.detail || data.message || data.error;
+      detail = data.detail || data;
+      message = (typeof detail === "object" ? detail.message || detail.code : detail) || data.message || data.error;
     } else if (typeof data === "string") {
       message = data;
     }
-    throw new Error(message || `${endpointKey} failed with HTTP ${response.status}`);
+    const err = new Error(message || `${endpointKey} failed with HTTP ${response.status}`);
+    err.status = response.status;
+    err.detail = detail || data;
+    err.code = (detail && typeof detail === "object" && detail.code) || "";
+    throw err;
   }
 
   return data;
@@ -477,6 +487,22 @@ const ApiService = {
   logout() {
     this.clearAuth();
     return true;
+  },
+
+  async getMedicalVerificationStatus() {
+    return callApi("medicalVerificationStatus");
+  },
+
+  async verifyMedicalId(formData) {
+    return callApi("verifyMedicalId", formData);
+  },
+
+  async requestEmailVerification(email) {
+    return callApi("emailChallengeReq", { email });
+  },
+
+  async verifyEmailCode(email, code) {
+    return callApi("emailChallengeVerify", { email, code });
   },
 
   saveConfig(newConfig) {

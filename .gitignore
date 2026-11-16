@@ -52,3 +52,9 @@ concept-mastery/data/uploads/*
 # Temporary archives
 concept-mastery.zip
 
+# Local execution helpers & review docs
+run.bat
+run.ps1
+PR Review Implementation Requirements.pdf
+
+
